@@ -240,7 +240,7 @@ ___
 
 ```markdown
 <!-- 加载图像 -->
-![Markdown](./img1.png)
+![Markdown](01 prompt/img1.png)
 ![Markdown](./img1.png "这是一个 Markdown Logo")
 ![示例图2](./img2.png)
 ```
