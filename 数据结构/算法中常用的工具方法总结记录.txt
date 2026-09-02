@@ -1,0 +1,4 @@
+Arrays.sort() 数组排序
+str.toCharArray() 字符串转成字符数组
+new String(字符数组）
+str.toCharArray()

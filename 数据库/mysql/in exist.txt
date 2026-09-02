@@ -1,0 +1,6 @@
+https://blog.csdn.net/taomeechildren/article/details/128922688
+
+8.0对exist和 in做了优化 explain查看 是先查子查询 再针对外表左 re_ref
+
+小表驱动大表:
+https://blog.csdn.net/m0_57836225/article/details/141175502 
