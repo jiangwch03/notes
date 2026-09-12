@@ -125,6 +125,178 @@ Binlog 是主从同步的基础，有三种格式：
 
 ---
 
+## 基于 VIP + Keepalived 的高可用切换方案
+
+读写分离架构中，**主库是唯一的写入口**。如果主库宕机，业务需要尽快切换到从库继续提供写服务。使用 **VIP（虚拟 IP）+ Keepalived** 是一种轻量级、常用的主库故障切换方案。
+
+### 核心思路
+
+- 业务应用不直接连接真实主库 IP，而是连接一个 **VIP（Virtual IP，虚拟 IP）**。
+- VIP 绑定在**当前主库**上，写流量通过 VIP 进入主库。
+- 主库宕机后，**Keepalived 将 VIP 漂移到从库**，并配合脚本将**从库提升为新的主库**。
+- 应用层无需修改数据库连接地址，只需要等待 VIP 漂移完成即可恢复。
+
+### 架构图
+
+```
+                 ┌─────────────────┐
+                 │   业务应用       │
+                 │  连接 VIP:3306  │
+                 └────────┬────────┘
+                          │
+                  ┌───────┴───────┐
+                  │  VIP 浮动地址  │
+                  │ 192.168.1.100 │
+                  └───────┬───────┘
+                          │
+              ┌─────────────┼─────────────┐
+              │             │             │
+         ┌────┴────┐   ┌────┴────┐   ┌────┴────┐
+         │  Master │   │  Slave1 │   │  Slave2 │
+         │ Keepal. │   │ Keepal. │   │ Keepal. │
+         │  priority=100  │   │ priority=90  │   │ priority=80  │
+         └─────────┘   └─────────┘   └─────────┘
+```
+
+### 工作流程
+
+1. **正常状态**
+   - VIP 绑定在 Master 上
+   - 应用通过 VIP 写入 Master
+   - Slave 通过 Binlog 从 Master 同步数据
+
+2. **Master 宕机**
+   - Keepalived 检测到 Master 故障
+   - VIP 漂移到优先级最高的 Slave
+   - 触发提升脚本：停止从库复制、重置主从关系、将 Slave 提升为新的 Master
+
+3. **应用恢复写入**
+   - VIP 漂移到新主库后，应用 reconnect 到 VIP
+   - 写流量自动进入新主库
+
+### Keepalived 配置示例
+
+#### 主库配置
+
+```bash
+# /etc/keepalived/keepalived.conf
+vrrp_script check_mysql {
+    script "/etc/keepalived/check_mysql.sh"
+    interval 2
+    weight -20
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass 1234
+    }
+
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+
+    track_script {
+        check_mysql
+    }
+
+    notify_master "/etc/keepalived/notify_master.sh"
+    notify_backup "/etc/keepalived/notify_backup.sh"
+    notify_fault "/etc/keepalived/notify_fault.sh"
+}
+```
+
+#### 从库配置
+
+```bash
+# /etc/keepalived/keepalived.conf
+vrrp_instance VI_1 {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 90
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass 1234
+    }
+
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+
+    track_script {
+        check_mysql
+    }
+}
+```
+
+### MySQL 健康检查脚本
+
+```bash
+# /etc/keepalived/check_mysql.sh
+#!/bin/bash
+MYSQL_STATUS=$(mysqladmin -uroot -p密码 ping 2>/dev/null | grep -c alive)
+if [ "$MYSQL_STATUS" -eq 1 ]; then
+    exit 0  # 健康
+else
+    exit 1  # 不健康，Keepalived 会降低优先级触发切换
+fi
+```
+
+### 从库提升脚本（简化版）
+
+```bash
+# /etc/keepalived/promote_slave.sh
+#!/bin/bash
+# 停止当前从库的复制
+mysql -uroot -p密码 -e "STOP SLAVE;"
+
+# 重置主从关系
+mysql -uroot -p密码 -e "RESET SLAVE ALL;"
+
+# 开启 binlog、关闭只读
+mysql -uroot -p密码 -e "SET GLOBAL read_only=0;"
+mysql -uroot -p密码 -e "SET GLOBAL super_read_only=0;"
+
+# 可选：通知其他从库切换主库指向
+# CHANGE MASTER TO MASTER_HOST='新主库IP', ...
+```
+
+> 生产环境中，提升脚本通常由 MHA / Orchestrator 等专业工具替代，更可靠。
+
+### 优点与风险
+
+| 优点 | 说明 |
+|------|------|
+| 配置简单 | 相比 MHA/MGR，部署成本低 |
+| 对应用透明 | 应用始终连接 VIP，无需改配置 |
+| 快速切换 | 秒级完成 VIP 漂移 |
+
+| 风险 | 说明 |
+|------|------|
+| **数据丢失** | 异步复制下，主库宕机时未同步的 Binlog 可能丢失 |
+| **脑裂** | 网络抖动时，旧主库未被正确下线，VIP 可能同时在两台机器上 |
+| **切换脚本可靠性** | 提升脚本必须可靠，否则 VIP 漂过去但数据库没提升成功 |
+| **旧主恢复后处理** | 旧主恢复后不能直接加回集群，需先同步新主数据 |
+
+### 适用场景
+
+- 中小型企业内部系统
+- 读多写少、对一致性要求不高的业务
+- 作为更复杂高可用方案（MHA / MGR）之外的轻量替代
+
+---
+
 ## GTID 复制机制
 
 GTID（Global Transaction Identifier）是 MySQL 5.6 引入的全局事务标识符，用于替代传统的 `file + position` 定位方式。
